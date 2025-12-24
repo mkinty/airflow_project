@@ -1,0 +1,6 @@
+*.log
+.idea/
+logs/
+veng/
+videos/
+__pycache__
