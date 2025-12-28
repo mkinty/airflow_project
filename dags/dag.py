@@ -34,7 +34,16 @@ ALL_STATES_URL = "https://opensky-network.org/api/states/all?extended=true"
 DB_FILE_PATH = "/opt/airflow/dags/data/bdd_airflow.duckdb"
 
 
-@task()
+def to_dict(states_list, columns, timestamp):
+    out = []
+    for state in states_list:
+        state_dict = dict(zip(columns, state))
+        state_dict["timestamp"] = timestamp
+        out.append(state_dict)
+    return out
+
+
+@task(multiple_outputs=True)
 def get_flight_data(columns, url):
     req = requests.get(url)
     response = req.json()
@@ -44,19 +53,21 @@ def get_flight_data(columns, url):
 
     timestamp = response.get("time", None)
     states_list = response.get("states", [])
-    states_json = [dict(zip(columns, state)) for state in states_list]
+    states_json = to_dict(states_list, columns, timestamp)
 
     data_file_path = f"/opt/airflow/dags/data/data_{timestamp}.json"
+
     with open(data_file_path, "w") as file:
         json.dump(states_json, file)
+
     print(f"Données téléchargées dans {data_file_path}")
-    return data_file_path
+    return {"file_name": data_file_path, "timestamp": timestamp, "rows": len(states_list)}
 
 
 @task()
 def load_from_file(db_file_path, ti=None):
     conn = None
-    data_file_path = ti.xcom_pull(task_ids='get_flight_data', key='return_value')
+    data_file_path = ti.xcom_pull(task_ids='get_flight_data', key='file_name')
     try:
         conn = duckdb.connect(db_file_path)
         # Créer la table si elle n'existe pas et insérer les données
@@ -78,18 +89,23 @@ def load_from_file(db_file_path, ti=None):
 
 
 @task()
-def check_row_numbers(db_file_path):
+def check_row_numbers(db_file_path, ti=None):
     conn = None
-    nb_rows = 0
+    lines_found = 0
+    xcom_content = ti.xcom_pull(task_ids='get_flight_data', key='return_value')
+    timestamp = xcom_content.get("timestamp", None)
+    expected_lines = xcom_content.get("rows", None)
     try:
         conn = duckdb.connect(db_file_path, read_only=True)  # lecture seule pour éviter le vérou
-        nb_rows = conn.sql(f"SELECT count(*) FROM bdd_airflow.main.opskynetwork_brute").fetchone()[0]
-    except Exception as e:
-        print("Erreur DuckDB:", e)
+        lines_found = conn.sql(f"SELECT count(*) FROM bdd_airflow.main.opskynetwork_brute WHERE timestamp={timestamp}").fetchone()[0]
     finally:
         if conn:
             conn.close()
-    print("Nombre de lignes : ", nb_rows)
+
+    if lines_found != expected_lines:
+        raise Exception(f"Nombre de lignes chargees ({lines_found}) != nombre de lignes de l'API ({expected_lines})")
+
+    print(f"Nombre de lignes = {lines_found}")
 
 
 @task
