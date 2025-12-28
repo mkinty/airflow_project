@@ -1,6 +1,7 @@
 *.log
 .idea/
 .env
+dags/data
 logs/
 veng/
 videos/
