@@ -4,6 +4,7 @@ import requests
 from airflow.decorators import task
 from airflow.models.dag import dag
 from airflow.operators.empty import EmptyOperator
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 # Télécharger les données open sky
 
@@ -31,7 +32,7 @@ ALL_STATES_URL = "https://opensky-network.org/api/states/all?extended=true"
 
 # Chemins absolus dans le container
 # DATA_FILE_PATH = "/opt/airflow/dags/data/data.json"
-DB_FILE_PATH = "/opt/airflow/dags/data/bdd_airflow.duckdb"
+# DB_FILE_PATH = "/opt/airflow/dags/data/bdd_airflow"
 
 
 def to_dict(states_list, columns, timestamp):
@@ -64,43 +65,24 @@ def get_flight_data(columns, url):
     return {"file_name": data_file_path, "timestamp": timestamp, "rows": len(states_list)}
 
 
-@task()
-def load_from_file(db_file_path, ti=None):
-    conn = None
-    data_file_path = ti.xcom_pull(task_ids='get_flight_data', key='file_name')
-    try:
-        conn = duckdb.connect(db_file_path)
-        # Créer la table si elle n'existe pas et insérer les données
-        # conn.sql(f"""
-        # CREATE TABLE IF NOT EXISTS opskynetwork_brute AS
-        # SELECT * FROM read_json_auto('{data_file_path}')
-        # """)
-        # Une fois la table créée, il faut simplement inserer les novelles données
-        conn.sql(f"""
-                INSERT INTO bdd_airflow.main.opskynetwork_brute
-                (SELECT * FROM read_json_auto('{data_file_path}'))
-                """)
-        print(f"Données insérées dans {db_file_path}")
-    except Exception as e:
-        print("Erreur DuckDB:", e)
-    finally:
-        if conn:
-            conn.close()
+def load_from_file():
+    return SQLExecuteQueryOperator(
+        task_id="load_from_file",
+        conn_id="DUCK_DB",
+        # sql="""
+        # INSERT INTO bdd_airflow.main.openskynetwork_brute
+        # (SELECT * FROM '{{ ti.xcom_pull(task_ids="get_flight_data", key="file_name") }}')
+        # """,
+        sql="load_from_file.sql",
+        return_last=True,
+        show_return_value_in_logs=True
+    )
 
 
 @task()
-def check_row_numbers(db_file_path, ti=None):
-    conn = None
-    lines_found = 0
-    xcom_content = ti.xcom_pull(task_ids='get_flight_data', key='return_value')
-    timestamp = xcom_content.get("timestamp", None)
-    expected_lines = xcom_content.get("rows", None)
-    try:
-        conn = duckdb.connect(db_file_path, read_only=True)  # lecture seule pour éviter le vérou
-        lines_found = conn.sql(f"SELECT count(*) FROM bdd_airflow.main.opskynetwork_brute WHERE timestamp={timestamp}").fetchone()[0]
-    finally:
-        if conn:
-            conn.close()
+def check_row_numbers(ti=None):
+    expected_lines = ti.xcom_pull(task_ids='get_flight_data', key='rows')
+    lines_found = ti.xcom_pull(task_ids='load_from_file', key='return_value')[0][0]
 
     if lines_found != expected_lines:
         raise Exception(f"Nombre de lignes chargees ({lines_found}) != nombre de lignes de l'API ({expected_lines})")
@@ -108,24 +90,14 @@ def check_row_numbers(db_file_path, ti=None):
     print(f"Nombre de lignes = {lines_found}")
 
 
-@task
-def check_duplicates(db_file_path):
-    conn = None
-    nb_duplicates = 0
-    try:
-        conn = duckdb.connect(db_file_path, read_only=True)
-        nb_duplicates = conn.sql("""
-        SELECT callsign, time_position, last_contact, count(*) AS cnt
-        FROM bdd_airflow.main.opskynetwork_brute
-        GROUP BY 1, 2, 3
-        HAVING cnt > 1;
-        """).count(column="cnt").fetchone()[0]
-    except Exception as e:
-        print("Erreur DuckDB:", e)
-    finally:
-        if conn:
-            conn.close()
-    print("Nombre de lignes : ", nb_duplicates)
+def check_duplicates():
+    return SQLExecuteQueryOperator(
+        task_id="check_duplicates",
+        conn_id="DUCK_DB",
+        sql="check_duplicates.sql",
+        return_last=True,
+        show_return_value_in_logs=True
+    )
 
 
 @dag()
@@ -133,8 +105,8 @@ def flights_pipeline():
     (
             EmptyOperator(task_id="start")
             >> get_flight_data(OPEN_SKY_COLUMNS, ALL_STATES_URL)
-            >> load_from_file(DB_FILE_PATH)
-            >> [check_row_numbers(DB_FILE_PATH), check_duplicates(DB_FILE_PATH)]
+            >> load_from_file()
+            >> [check_row_numbers(), check_duplicates()]
             >> EmptyOperator(task_id="end")
     )
 
