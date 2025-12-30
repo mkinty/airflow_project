@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import datetime
 
 import requests
 from airflow.decorators import task
@@ -7,13 +8,13 @@ from airflow.models import Param
 from airflow.models.dag import dag
 from airflow.operators.empty import EmptyOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.sensors.filesystem import FileSensor
 
 # Télécharger les données open sky
 
 endpoint_to_params = {
     "states": {
         "url": "https://opensky-network.org/api/states/all?extended=true",
-        "file_name": "/opt/airflow/dags/data/data_{timestamp}.json",
         "columns": [
             "icao24",
             "callsign",
@@ -39,7 +40,6 @@ endpoint_to_params = {
     },
     "flights": {
         "url": "https://opensky-network.org/api/flights/all?begin={begin}&end={end}",
-        "file_name": "/opt/airflow/dags/data/data_{timestamp}.json",
         "columns": ['icao24',
                     'firstSeen',
                     'estDepartureAirport',
@@ -59,7 +59,7 @@ endpoint_to_params = {
 
 
 # Chemins absolus dans le container
-# DATA_FILE_PATH = "/opt/airflow/dags/data/data.json"
+# data_file_name = "/opt/airflow/dags/data/data.json"
 # DB_FILE_PATH = "/opt/airflow/dags/data/bdd_airflow"
 
 
@@ -80,29 +80,40 @@ def flights_to_dict(flights, timestamp):
     return out
 
 
-@task(multiple_outputs=True)
-def run_parameters(params=None):
-    out = endpoint_to_params[params["endpoint"]]
-    timestamp = int(time.time())
-    if out["timestamp_required"]:
-        begin = timestamp - 3600
-        out["url"] = out["url"].format(begin=begin, end=timestamp)
+def format_datetime(input_datetime):
+    return input_datetime.strftime("%Y%m%d")
 
-    out["file_name"] = out["file_name"].format(timestamp=timestamp)
+
+@task(multiple_outputs=True)
+def run_parameters(params=None, dag_run=None):
+    data_interval_start = format_datetime(dag_run.data_interval_start)
+    data_interval_end = format_datetime(dag_run.data_interval_end)
+
+    out = endpoint_to_params[params["endpoint"]]
+    if out["timestamp_required"]:
+        end = int(time.time())
+        begin = end - 3600
+        out["url"] = out["url"].format(begin=begin, end=end)
+
+    out["data_file_name"] = f"/opt/airflow/dags/data/data_{data_interval_start}_{data_interval_end}.json"
 
     return out
 
 
 @task(multiple_outputs=True)
 def get_flight_data(ti=None):
-    url = ti.xcom_pull(task_ids="run_parameters", key="url")
-    columns = ti.xcom_pull(task_ids="run_parameters", key="columns")
-    data_file_path = ti.xcom_pull(task_ids="run_parameters", key="file_name")
+    # Retrouve les paramètres de la tâche run_parameters
+    run_params = ti.xcom_pull(task_ids="run_parameters", key="return_value")
+    url = run_params["url"]
+    columns = run_params["columns"]
+    data_file_name = run_params["data_file_name"]
 
+    # Télécharge les données
     req = requests.get(url)
     req.raise_for_status()
     response = req.json()
 
+    # Transforme les données selon l'API d'origine
     if "states" in response:
         timestamp = response.get("time", None)
         results_json = states_to_dict(response.get("states", []), columns, timestamp)
@@ -110,12 +121,12 @@ def get_flight_data(ti=None):
         timestamp = int(time.time())
         results_json = flights_to_dict(response, timestamp)
 
-    # data_file_path = f"/opt/airflow/dags/data/data_{timestamp}.json"
+    # data_file_name = f"/opt/airflow/dags/data/data_{timestamp}.json"
 
-    with open(data_file_path, "w") as file:
+    with open(data_file_name, "w") as file:
         json.dump(results_json, file)
 
-    return {"file_name": data_file_path, "timestamp": timestamp, "rows": len(results_json)}
+    return {"data_file_name": data_file_name, "timestamp": timestamp, "rows": len(results_json)}
 
 
 def load_from_file():
@@ -124,7 +135,7 @@ def load_from_file():
         conn_id="DUCK_DB",
         # sql="""
         # INSERT INTO bdd_airflow.main.openskynetwork_brute
-        # (SELECT * FROM '{{ ti.xcom_pull(task_ids="get_flight_data", key="file_name") }}')
+        # (SELECT * FROM '{{ ti.xcom_pull(task_ids="get_flight_data", key="data_file_name") }}')
         # """,
         sql="load_from_file.sql",
         return_last=True,
@@ -157,15 +168,24 @@ def check_duplicates():
     params={
         "endpoint": Param(
             default="states",
-            enum=list(
-                endpoint_to_params.keys()
-            )
+            enum=list(endpoint_to_params.keys())
         )
-    }
+    },
+    start_date=datetime(2025, 12, 1),
+    schedule_interval="0 0 * * *",
+    catchup=False,
+    concurrency=1,
 )
 def flights_pipeline():
     (
             EmptyOperator(task_id="start")
+            >> FileSensor(
+                task_id="waite_for_file",
+                fs_conn_id="file_conn",
+                filepath="/opt/airflow/dags/new_data/{{ params.endpoint }}.json",
+                poke_interval=120,
+                mode="reschedule",
+                timeout=600)
             >> run_parameters()
             >> get_flight_data()
             >> load_from_file()
