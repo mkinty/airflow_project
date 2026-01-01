@@ -2,6 +2,7 @@ import json
 import time
 from datetime import datetime
 
+import duckdb
 import requests
 from airflow.decorators import task, task_group
 from airflow.models import Param
@@ -87,23 +88,30 @@ def format_datetime(input_datetime):
 
 @task(multiple_outputs=True)
 def run_parameters(api, dag_run=None):
+    out = api
+
     data_interval_start = format_datetime(dag_run.data_interval_start)
     data_interval_end = format_datetime(dag_run.data_interval_end)
 
-    out = api
+    data_file_name = f"/opt/airflow/dags/data/data_{out['name']}_{data_interval_start}_{data_interval_end}.json"
+    out["data_file_name"] = data_file_name
+
+    # SQL pour charger les données dans la DWH
+    with open("/opt/airflow/dags/load_from_file.sql", "r") as file:
+        load_from_file_sql = file.read().format(target_table=out["target_table"], data_file_name=data_file_name)
+    out["load_from_file_sql"] = load_from_file_sql
+
     if out["timestamp_required"]:
         end = int(time.time())
         begin = end - 3600
         out["url"] = out["url"].format(begin=begin, end=end)
 
-    out["data_file_name"] = f"/opt/airflow/dags/data/data_{data_interval_start}_{data_interval_end}.json"
-
-    return out
+    return {"run_params": out}
 
 
 @task_group
 def data_ingestion_tg(run_params):
-    get_flight_data(run_params) >> load_from_file()
+    get_flight_data(run_params) >> load_from_file(run_params)
 
 
 @task(multiple_outputs=True)
@@ -134,18 +142,10 @@ def get_flight_data(run_params):
     return {"data_file_name": data_file_name, "timestamp": timestamp, "rows": len(results_json)}
 
 
-def load_from_file():
-    return SQLExecuteQueryOperator(
-        task_id="load_from_file",
-        conn_id="DUCK_DB",
-        # sql="""
-        # INSERT INTO bdd_airflow.main.openskynetwork_brute
-        # (SELECT * FROM '{{ ti.xcom_pull(task_ids="get_flight_data", key="data_file_name") }}')
-        # """,
-        sql="load_from_file.sql",
-        return_last=True,
-        show_return_value_in_logs=True
-    )
+@task()
+def load_from_file(run_params):
+    with duckdb.connect("/opt/airflow/dags/data/bdd_airflow") as conn:
+        conn.sql(run_params["load_from_file_sql"])
 
 
 @task_group
@@ -175,23 +175,21 @@ def check_duplicates():
     )
 
 
-for api in apis_list:
-    @dag(
-        dag_id=api["name"],
-        start_date=datetime(2025, 12, 1),
-        schedule_interval=api["schedule"],
-        catchup=False,
-        concurrency=1,
+@dag(
+    start_date=datetime(2025, 12, 1),
+    schedule=None,
+    catchup=False,
+    concurrency=1,
+)
+def flights_pipeline():
+    run_parameters_task = run_parameters.expand(api=apis_list)
+    (
+            EmptyOperator(task_id="start")
+            >> run_parameters_task
+            >> data_ingestion_tg.expand_kwargs(run_parameters_task)
+            # >> data_quality_tg()
+            >> EmptyOperator(task_id="end")
     )
-    def flights_pipeline():
-        run_parameters_task = run_parameters(api)
-        (
-                EmptyOperator(task_id="start")
-                >> run_parameters_task
-                >> data_ingestion_tg(run_params=run_parameters_task)
-                >> data_quality_tg()
-                >> EmptyOperator(task_id="end")
-        )
 
 
-    flights_pipeline()
+flights_pipeline()
