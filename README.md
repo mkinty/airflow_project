@@ -1,6 +1,10 @@
 # Pipeline de Données Airflow – OpenSky Network
 ___
 
+**Pipeline De Données Construite**
+
+![DAG OpenSky Airflow](images/dag_opensky.png)
+
 **Objectif du projet**
 
 Ce projet a pour objectif de concevoir et orchestrer un pipeline de données avec Apache Airflow permettant de :
@@ -58,5 +62,3 @@ Apache Airflow (DAG dynamique)
      DuckDB
 ```
 
-## Pipeline De Données Construite
-![DAG OpenSky Airflow](images/dag_opensky.png)
