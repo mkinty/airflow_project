@@ -1,9 +1,11 @@
 import json
 import time
-from datetime import datetime
-
+import pandas as pd
 import duckdb
 import requests
+
+from datetime import datetime
+
 from airflow.decorators import task, task_group
 from airflow.models import Param
 from airflow.models.dag import dag
@@ -111,7 +113,14 @@ def run_parameters(api, dag_run=None):
 
 @task_group
 def data_ingestion_tg(run_params):
-    get_flight_data(run_params) >> load_from_file(run_params)
+    flight_data = get_flight_data(run_params)
+
+    branch = choose_branch(flight_data["rows"])
+
+    insert = insert_data(run_params, flight_data["json_data"])
+    load = load_from_file(run_params)
+
+    branch >> [insert, load]
 
 
 @task(multiple_outputs=True)
@@ -138,14 +147,35 @@ def get_flight_data(run_params):
 
     with open(data_file_name, "w") as file:
         json.dump(results_json, file)
+    rows = len(results_json)
+    json_data = results_json if rows < 600 else []
+    return {"data_file_name": data_file_name, "timestamp": timestamp, "rows": rows, "json_data": json_data}
 
-    return {"data_file_name": data_file_name, "timestamp": timestamp, "rows": len(results_json)}
+
+@task
+def insert_data(run_params, json_data):
+    with duckdb.connect("/opt/airflow/dags/data/bdd_airflow") as conn:
+        df = pd.DataFrame(json_data)
+        conn.register("df_opensky", df)
+        conn.sql(f"""
+            INSERT INTO {run_params["target_table"]}
+            SELECT * FROM df_opensky
+        """)
 
 
 @task()
 def load_from_file(run_params):
     with duckdb.connect("/opt/airflow/dags/data/bdd_airflow") as conn:
         conn.sql(run_params["load_from_file_sql"])
+
+
+@task.branch
+def choose_branch(rows):
+    if rows < 600:
+        return "data_ingestion_tg.insert_data"
+    else:
+        return "data_ingestion_tg.load_from_file"
+
 
 
 @task_group
@@ -158,6 +188,8 @@ def data_quality_tg():
 def check_row_numbers(ti=None):
     expected_lines = ti.xcom_pull(task_ids='data_ingestion_tg.get_flight_data', key='rows')
     lines_found = ti.xcom_pull(task_ids='data_ingestion_tg.load_from_file', key='return_value')[0][0]
+
+    # print(f"Lines found : {lines_found}")
 
     if lines_found != expected_lines:
         raise Exception(f"Nombre de lignes chargees ({lines_found}) != nombre de lignes de l'API ({expected_lines})")
