@@ -1,9 +1,7 @@
 # Pipeline de Données Airflow – OpenSky Network
 ___
-
-**Pipeline De Données Construite**
-
 ![DAG OpenSky Airflow](images/dag_opensky.png)
+___
 
 **Objectif du projet**
 
